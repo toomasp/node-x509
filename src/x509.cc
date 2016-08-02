@@ -45,6 +45,18 @@ std::string parse_args(const Nan::FunctionCallbackInfo<v8::Value>& info) {
   return *String::Utf8Value(info[0]->ToString());
 }
 
+NAN_METHOD(get_altnames) {
+  Nan::HandleScope scope;
+  std::string parsed_arg = parse_args(info);
+  if(parsed_arg.size() == 0) {
+    info.GetReturnValue().SetUndefined();
+  }
+  Local<Object> exports(try_parse(parsed_arg)->ToObject());
+  Local<Value> key = Nan::New<String>("altNames").ToLocalChecked();
+  info.GetReturnValue().Set(
+    Nan::Get(exports, key).ToLocalChecked());
+}
+
 NAN_METHOD(get_subject) {
   Nan::HandleScope scope;
   std::string parsed_arg = parse_args(info);
@@ -113,6 +125,7 @@ Local<Value> try_parse(const std::string& dataString) {
     // If raw read fails, try reading the input as a filename.
     if (!BIO_read_filename(bio, data)) {
       Nan::ThrowError("File doesn't exist.");
+      BIO_free(bio);
       return scope.Escape(exports);
     }
 
@@ -121,6 +134,7 @@ Local<Value> try_parse(const std::string& dataString) {
 
     if (cert == NULL) {
       Nan::ThrowError("Unable to parse certificate.");
+      BIO_free(bio);
       return scope.Escape(exports);
     }
   }
@@ -148,6 +162,8 @@ Local<Value> try_parse(const std::string& dataString) {
   int sig_alg_nid = OBJ_obj2nid(cert->sig_alg->algorithm);
   if (sig_alg_nid == NID_undef) {
     Nan::ThrowError("unable to find specified signature algorithm name.");
+    X509_free(cert);
+    BIO_free(bio);
     return scope.Escape(exports);
   }
   Nan::Set(exports,
@@ -180,6 +196,8 @@ Local<Value> try_parse(const std::string& dataString) {
   int pkey_nid = OBJ_obj2nid(cert->cert_info->key->algor->algorithm);
   if (pkey_nid == NID_undef) {
     Nan::ThrowError("unable to find specified public key algorithm name.");
+    X509_free(cert);
+    BIO_free(bio);
     return scope.Escape(exports);
   }
   EVP_PKEY *pkey = X509_get_pubkey(cert);
@@ -204,6 +222,33 @@ Local<Value> try_parse(const std::string& dataString) {
   Nan::Set(exports, Nan::New<String>("publicKey").ToLocalChecked(), publicKey);
   EVP_PKEY_free(pkey);
 
+  // alt names
+  Local<Array> altNames(Nan::New<Array>());
+  STACK_OF(GENERAL_NAME) *names = NULL;
+  int i;
+
+  names = (STACK_OF(GENERAL_NAME)*) X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+
+  if (names != NULL) {
+    int length = sk_GENERAL_NAME_num(names);
+    for (i = 0; i < length; i++) {
+      GENERAL_NAME *current = sk_GENERAL_NAME_value(names, i);
+
+      if (current->type == GEN_DNS) {
+        char *name = (char*) ASN1_STRING_data(current->d.dNSName);
+
+        if (ASN1_STRING_length(current->d.dNSName) != (int) strlen(name)) {
+          Nan::ThrowError("Malformed alternative names field.");
+          X509_free(cert);
+          BIO_free(bio);
+          return scope.Escape(exports);
+        }
+        Nan::Set(altNames, i, Nan::New<String>(name).ToLocalChecked());
+      }
+    }
+  }
+  Nan::Set(exports, Nan::New<String>("altNames").ToLocalChecked(), altNames);
+
   // Extensions
   Local<Object> extensions(Nan::New<Object>());
   STACK_OF(X509_EXTENSION) *exts = cert->cert_info->extensions;
@@ -220,6 +265,8 @@ Local<Value> try_parse(const std::string& dataString) {
   for (index_of_exts = 0; index_of_exts < num_of_exts; index_of_exts++) {
     X509_EXTENSION *ext = sk_X509_EXTENSION_value(exts, index_of_exts);
     // IFNULL_FAIL(ext, "unable to extract extension from stack");
+    ASN1_OBJECT *obj = X509_EXTENSION_get_object(ext);
+    // IFNULL_FAIL(obj, "unable to extract ASN1 object from extension");
 
     BIO *ext_bio = BIO_new(BIO_s_mem());
     // IFNULL_FAIL(ext_bio, "unable to allocate memory for extension value BIO");
@@ -237,31 +284,20 @@ Local<Value> try_parse(const std::string& dataString) {
 
     BIO_free(ext_bio);
 
-    int nid = OBJ_obj2nid(ext->object);
-    switch (nid) {
-      case NID_undef: {
-        char extname[100];
-        OBJ_obj2txt(extname, 100, (const ASN1_OBJECT *) ext->object, 1);
-        Nan::Set(extensions,
-          Nan::New<String>(real_name(extname)).ToLocalChecked(),
-          Nan::New<String>(data).ToLocalChecked());
-        break;
-      }
-      case NID_subject_alt_name: {
-        const char *c_ext_name = OBJ_nid2ln(nid);
-        // IFNULL_FAIL(c_ext_name, "invalid X509v3 extension name");
-        Nan::Set(extensions,
-          Nan::New<String>(c_ext_name).ToLocalChecked(),
-          parse_subject_alt_names(ext));
-        break;
-      }
-      default: {
-        const char *c_ext_name = OBJ_nid2ln(nid);
-        // IFNULL_FAIL(c_ext_name, "invalid X509v3 extension name");
-        Nan::Set(extensions,
-          Nan::New<String>(real_name((char*)c_ext_name)).ToLocalChecked(),
-          Nan::New<String>(data).ToLocalChecked());
-      }
+    unsigned nid = OBJ_obj2nid(obj);
+    if (nid == NID_undef) {
+      char extname[100];
+      OBJ_obj2txt(extname, 100, (const ASN1_OBJECT *) obj, 1);
+      Nan::Set(extensions, 
+        Nan::New<String>(real_name(extname)).ToLocalChecked(), 
+        Nan::New<String>(data).ToLocalChecked());
+
+    } else {
+      const char *c_ext_name = OBJ_nid2ln(nid);
+      // IFNULL_FAIL(c_ext_name, "invalid X509v3 extension name");
+      Nan::Set(extensions,
+        Nan::New<String>(real_name((char*)c_ext_name)).ToLocalChecked(), 
+        Nan::New<String>(data).ToLocalChecked());
     }
   }
   Nan::Set(exports,
@@ -323,143 +359,6 @@ Local<Object> parse_name(X509_NAME *subject) {
       Nan::New<String>((const char*) value).ToLocalChecked());
   }
   return scope.Escape(cert);
-}
-
-Local<Object> parse_subject_alt_names(X509_EXTENSION *ext) {
-  Nan::EscapableHandleScope scope;
-  Local<Object> subAltNames = Nan::New<Object>();
-  Local<Array> email = Nan::New<Array>();
-  Local<Array> dns = Nan::New<Array>();
-  Local<Array> dirName = Nan::New<Array>();
-  Local<Array> uri = Nan::New<Array>();
-  Local<Array> ipaddr = Nan::New<Array>();
-  Local<Array> rid = Nan::New<Array>();
-
-  const unsigned char *pp = ext->value->data;
-  GENERAL_NAMES *names = d2i_GENERAL_NAMES(NULL, &pp, ext->value->length);
-  if (names != NULL) {
-    int i;
-    for (i = 0; i < sk_GENERAL_NAME_num(names); i++) {
-      GENERAL_NAME *current = sk_GENERAL_NAME_value(names, i);
-      switch (current->type) {
-        case GEN_OTHERNAME: {
-          int nid = OBJ_obj2nid(current->d.otherName->type_id);
-          if (nid == NID_undef) {
-            Nan::Set(subAltNames,
-              Nan::New<String>("otherName").ToLocalChecked(),
-              Nan::New<String>("<unsupported>").ToLocalChecked());
-          } else {
-            const char *name = OBJ_nid2sn(nid);
-            ASN1_STRING *asn1 = current->d.otherName->value->value.asn1_string;
-            char *value = (char*) ASN1_STRING_data(asn1);
-            if (ASN1_STRING_length(asn1) != (int) strlen(value)) {
-              Nan::ThrowError("Malformed otherName field.");
-              return scope.Escape(subAltNames);
-            }
-            Nan::Set(subAltNames,
-              Nan::New<String>(name).ToLocalChecked(),
-              Nan::New<String>(value).ToLocalChecked());
-          }
-          break;
-        }
-        case GEN_EMAIL: {
-          char *name = (char*) ASN1_STRING_data(current->d.rfc822Name);
-          if (ASN1_STRING_length(current->d.rfc822Name) != (int) strlen(name)) {
-            Nan::ThrowError("Malformed email field.");
-            return scope.Escape(subAltNames);
-          }
-          Nan::Set(email,
-            email->Length(),
-            Nan::New<String>(name).ToLocalChecked());
-          break;
-        }
-        case GEN_DNS: {
-          char *name = (char*) ASN1_STRING_data(current->d.dNSName);
-          if (ASN1_STRING_length(current->d.dNSName) != (int) strlen(name)) {
-            Nan::ThrowError("Malformed DNS field.");
-            return scope.Escape(subAltNames);
-          }
-          Nan::Set(dns,
-            dns->Length(),
-            Nan::New<String>(name).ToLocalChecked());
-          break;
-        }
-        case GEN_X400: {
-          Nan::Set(subAltNames,
-            Nan::New<String>("X400Name").ToLocalChecked(),
-            Nan::New<String>("<unsupported>").ToLocalChecked());
-          break;
-        }
-        case GEN_DIRNAME: {
-          char oline[256];
-          X509_NAME_oneline(current->d.dirn, oline, 256);
-          Nan::Set(dirName,
-            dirName->Length(),
-            Nan::New<String>(oline).ToLocalChecked());
-          break;
-        }
-        case GEN_EDIPARTY: {
-          Nan::Set(subAltNames,
-            Nan::New<String>("EdiPartyName").ToLocalChecked(),
-            Nan::New<String>("<unsupported>").ToLocalChecked());
-          break;
-        }
-        case GEN_URI: {
-          char *name = (char*) ASN1_STRING_data(current->d.uniformResourceIdentifier);
-          if (ASN1_STRING_length(current->d.uniformResourceIdentifier) != (int) strlen(name)) {
-            Nan::ThrowError("Malformed URI field.");
-            return scope.Escape(subAltNames);
-          }
-          Nan::Set(uri,
-            uri->Length(),
-            Nan::New<String>(name).ToLocalChecked());
-          break;
-        }
-        case GEN_IPADD: {
-          // Based on/pulled from OpenSSL v3_alt.c
-          char oline[256] = "<invalid>";
-          char htmp[5];
-          unsigned char *p = current->d.ip->data;
-          if (current->d.ip->length == 4) {
-            BIO_snprintf(oline, sizeof(oline), "%d.%d.%d.%d", p[0], p[1], p[2], p[3]);
-          } else if (current->d.ip->length == 16) {
-            oline[0] = 0;
-            for (i = 0; i < 8; i++) {
-              BIO_snprintf(htmp, sizeof htmp, "%X", p[0] << 8 | p[1]);
-              p += 2;
-              strcat(oline, htmp);
-              if (i != 7)
-                strcat(oline, ":");
-            }
-          }
-          Nan::Set(ipaddr,
-            ipaddr->Length(),
-            Nan::New<String>(oline).ToLocalChecked());
-          break;
-        }
-        case GEN_RID: {
-          char oline[256];
-          i2t_ASN1_OBJECT(oline, 256, current->d.rid);
-          Nan::Set(rid,
-            rid->Length(),
-            Nan::New<String>(oline).ToLocalChecked());
-          break;
-        }
-      }
-    }
-
-    if (email->Length() > 0)
-      Nan::Set(subAltNames, Nan::New<String>("email").ToLocalChecked(), email);
-    if (dns->Length() > 0)
-      Nan::Set(subAltNames, Nan::New<String>("dns").ToLocalChecked(), dns);
-    if (dirName->Length() > 0)
-      Nan::Set(subAltNames, Nan::New<String>("dirName").ToLocalChecked(), dirName);
-    if (uri->Length() > 0)
-      Nan::Set(subAltNames, Nan::New<String>("uri").ToLocalChecked(), uri);
-    if (ipaddr->Length() > 0)
-      Nan::Set(subAltNames, Nan::New<String>("ips").ToLocalChecked(), ipaddr);
-  }
-  return scope.Escape(subAltNames);
 }
 
 // Fix for missing fields in OpenSSL.

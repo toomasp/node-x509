@@ -1,4 +1,5 @@
 #include <cstring>
+#include <sstream>
 #include <x509.h>
 
 using namespace v8;
@@ -133,6 +134,7 @@ NAN_METHOD(get_altnames) {
   Local<Value> key = Nan::New<String>("altNames").ToLocalChecked();
   info.GetReturnValue().Set(
     Nan::Get(exports, key).ToLocalChecked());
+  ERR_clear_error();
 }
 
 NAN_METHOD(get_subject) {
@@ -145,6 +147,7 @@ NAN_METHOD(get_subject) {
   Local<Value> key = Nan::New<String>("subject").ToLocalChecked();
   info.GetReturnValue().Set(
     Nan::Get(exports, key).ToLocalChecked());
+  ERR_clear_error();
 }
 
 NAN_METHOD(get_issuer) {
@@ -157,6 +160,7 @@ NAN_METHOD(get_issuer) {
   Local<Value> key = Nan::New<String>("issuer").ToLocalChecked();
   info.GetReturnValue().Set(
     Nan::Get(exports, key).ToLocalChecked());
+  ERR_clear_error();
 }
 
 NAN_METHOD(parse_cert) {
@@ -167,6 +171,7 @@ NAN_METHOD(parse_cert) {
   }
   Local<Object> exports(try_parse(parsed_arg)->ToObject());
   info.GetReturnValue().Set(exports);
+  ERR_clear_error();
 }
 
 /*
@@ -197,11 +202,13 @@ Local<Value> try_parse(const std::string& dataString) {
   cert = PEM_read_bio_X509(bio, NULL, 0, NULL);
 
   if (cert == NULL) {
+    BIO_free_all(bio);
     // Switch to file BIO
     bio = BIO_new(BIO_s_file());
 
     // If raw read fails, try reading the input as a filename.
     if (!BIO_read_filename(bio, data)) {
+      ERR_clear_error();
       Nan::ThrowError("File doesn't exist.");
       BIO_free(bio);
       return scope.Escape(exports);
@@ -211,6 +218,7 @@ Local<Value> try_parse(const std::string& dataString) {
     cert = PEM_read_bio_X509(bio, NULL, 0, NULL);
 
     if (cert == NULL) {
+      ERR_clear_error();
       Nan::ThrowError("Unable to parse certificate.");
       BIO_free(bio);
       return scope.Escape(exports);
@@ -236,9 +244,17 @@ Local<Value> try_parse(const std::string& dataString) {
     Nan::New<String>("notAfter").ToLocalChecked(),
     parse_date(X509_get_notAfter(cert)));
 
+  // Subject hash
+  std::stringstream stream;
+  stream << std::hex << X509_subject_name_hash(cert);
+  Nan::Set(exports,
+    Nan::New<String>("subjectHash").ToLocalChecked(),
+      Nan::New<String>(stream.str()).ToLocalChecked());
+
   // Signature Algorithm
   int sig_alg_nid = OBJ_obj2nid(cert->sig_alg->algorithm);
   if (sig_alg_nid == NID_undef) {
+    ERR_clear_error();
     Nan::ThrowError("unable to find specified signature algorithm name.");
     X509_free(cert);
     BIO_free(bio);
@@ -273,6 +289,7 @@ Local<Value> try_parse(const std::string& dataString) {
   // public key
   int pkey_nid = OBJ_obj2nid(cert->cert_info->key->algor->algorithm);
   if (pkey_nid == NID_undef) {
+    ERR_clear_error();
     Nan::ThrowError("unable to find specified public key algorithm name.");
     X509_free(cert);
     BIO_free(bio);
@@ -286,16 +303,23 @@ Local<Value> try_parse(const std::string& dataString) {
 
   if (pkey_nid == NID_rsaEncryption) {
     char *rsa_e_dec, *rsa_n_hex;
+    uint32_t rsa_key_length_int;
     RSA *rsa_key;
     rsa_key = pkey->pkey.rsa;
     rsa_e_dec = BN_bn2dec(rsa_key->e);
     rsa_n_hex = BN_bn2hex(rsa_key->n);
+    rsa_key_length_int = RSA_size(rsa_key) * 8;
     Nan::Set(publicKey,
       Nan::New<String>("e").ToLocalChecked(),
       Nan::New<String>(rsa_e_dec).ToLocalChecked());
+    OPENSSL_free(rsa_e_dec);
     Nan::Set(publicKey,
       Nan::New<String>("n").ToLocalChecked(),
       Nan::New<String>(rsa_n_hex).ToLocalChecked());
+    OPENSSL_free(rsa_n_hex);
+    Nan::Set(publicKey,
+      Nan::New<String>("bitSize").ToLocalChecked(),
+      Nan::New<Uint32>(rsa_key_length_int));
   }
   Nan::Set(exports, Nan::New<String>("publicKey").ToLocalChecked(), publicKey);
   EVP_PKEY_free(pkey);
@@ -316,6 +340,7 @@ Local<Value> try_parse(const std::string& dataString) {
         char *name = (char*) ASN1_STRING_data(current->d.dNSName);
 
         if (ASN1_STRING_length(current->d.dNSName) != (int) strlen(name)) {
+          ERR_clear_error();
           Nan::ThrowError("Malformed alternative names field.");
           X509_free(cert);
           BIO_free(bio);
@@ -324,6 +349,7 @@ Local<Value> try_parse(const std::string& dataString) {
         Nan::Set(altNames, i, Nan::New<String>(name).ToLocalChecked());
       }
     }
+    sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
   }
   Nan::Set(exports, Nan::New<String>("altNames").ToLocalChecked(), altNames);
 
@@ -356,9 +382,9 @@ Local<Value> try_parse(const std::string& dataString) {
     BIO_get_mem_ptr(ext_bio, &bptr);
     BIO_set_close(ext_bio, BIO_CLOSE);
 
-    char *data = (char*) malloc(bptr->length + 1);
+    char *data = new char[bptr->length + 1];
     BUF_strlcpy(data, bptr->data, bptr->length + 1);
-    data = trim(data, bptr->length);
+    char *trimmed_data = trim(data, bptr->length);
 
     BIO_free(ext_bio);
 
@@ -368,19 +394,21 @@ Local<Value> try_parse(const std::string& dataString) {
       OBJ_obj2txt(extname, 100, (const ASN1_OBJECT *) obj, 1);
       Nan::Set(extensions,
         Nan::New<String>(real_name(extname)).ToLocalChecked(),
-        Nan::New<String>(data).ToLocalChecked());
+        Nan::New<String>(trimmed_data).ToLocalChecked());
 
     } else {
       const char *c_ext_name = OBJ_nid2ln(nid);
       // IFNULL_FAIL(c_ext_name, "invalid X509v3 extension name");
       Nan::Set(extensions,
         Nan::New<String>(real_name((char*)c_ext_name)).ToLocalChecked(),
-        Nan::New<String>(data).ToLocalChecked());
+        Nan::New<String>(trimmed_data).ToLocalChecked());
     }
+    delete[] data;
   }
   Nan::Set(exports,
     Nan::New<String>("extensions").ToLocalChecked(), extensions);
 
+  ERR_clear_error();
   X509_free(cert);
   BIO_free(bio);
 
